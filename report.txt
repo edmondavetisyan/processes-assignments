@@ -1,0 +1,175 @@
+Assignment 1 — Basic Process Creation with fork()
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+
+int main(void) {
+    setbuf(stdout, NULL);
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+
+    if (pid == 0) { // Child
+        printf("[child]  PID=%d, PPID=%d\n", getpid(), getppid());
+        _exit(0);
+    } else {        // Parent (does not wait)
+        printf("[parent] PID=%d (child PID=%d)\n", getpid(), pid);
+    }
+    return 0;
+}
+
+Analysis
+Syscalls: fork() once. Parent receives child PID (>0); child receives 0.
+Flow: After fork, both run. Parent prints and returns immediately; child prints and exits via exit(0).
+Relationship: PPID shows the parent. If the parent exits first, the child's PPID may change to 1 (system init).
+
+
+
+Assignment 2 — Using wait() and waitpid()
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+static void print_status(const char *tag, int status) {
+    if (WIFEXITED(status)) printf("%s exited with code %d\n", tag, WEXITSTATUS(status));
+    else if (WIFSIGNALED(status)) printf("%s killed by signal %d\n", tag, WTERMSIG(status));
+    else if (WIFSTOPPED(status)) printf("%s stopped by signal %d\n", tag, WSTOPSIG(status));
+    else puts("unknown status");
+}
+
+int main(void) {
+    setbuf(stdout, NULL);
+
+    pid_t c1 = fork();
+    if (c1 < 0) { perror("fork c1"); return 1; }
+    if (c1 == 0) { _exit(42); }
+
+    pid_t c2 = fork();
+    if (c2 < 0) { perror("fork c2"); return 1; }
+    if (c2 == 0) { _exit(7); }
+
+    int st = 0;
+    if (waitpid(c2, &st, 0) < 0) { perror("waitpid c2"); return 1; } // wait specific child
+    print_status("child2", st);
+
+    if (wait(&st) < 0) { perror("wait any"); return 1; }             // reap remaining
+    print_status("child1", st);
+    return 0;
+}
+
+Analysis
+Syscalls: two `fork()`, then `waitpid(c2)` and `wait()`.
+Flow: Parent targets child2 first deterministically; then reaps the other child.
+Return values: wait return the PID and fill status decoded with WIF*/WEXITSTATUS.
+
+
+Assignment 3 — Understanding atexit()
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void cleanup1(void) { puts("atexit: cleanup1"); }
+static void cleanup2(void) { puts("atexit: cleanup2"); }
+
+int main(int argc, char **argv) {
+    setbuf(stdout, NULL);
+    if (atexit(cleanup1) != 0 || atexit(cleanup2) != 0) { perror("atexit"); return 1; }
+
+    puts("main: running");
+
+    if (argc > 1) {
+        puts("main: early exit via exit(0)");
+        exit(0); // triggers atexit handlers in LIFO order: cleanup2 then cleanup1
+    }
+
+    puts("main: normal return");
+    return 0; // also triggers atexit handlers in LIFO order
+}
+
+Analysis
+Behavior: atexit handlers run in reverse registration order on return from main or exit() calls.
+Use cases:centralized cleanup—flush logs, remove temp files, close resources—without sprinkling cleanup code.
+
+
+Assignment 4 — Fork and Exit Status
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+static void report(const char *who, int status) {
+    if (WIFEXITED(status)) printf("%s exited with code %d\n", who, WEXITSTATUS(status));
+    else if (WIFSIGNALED(status)) printf("%s terminated by signal %d\n", who, WTERMSIG(status));
+    else printf("%s ended (other)\n", who);
+}
+
+int main(void) {
+    setbuf(stdout, NULL);
+
+    pid_t a = fork();
+    if (a < 0) { perror("fork a"); return 1; }
+    if (a == 0) { _exit(0); }
+
+    pid_t b = fork();
+    if (b < 0) { perror("fork b"); return 1; }
+    if (b == 0) { _exit(1); }
+
+    int st = 0;
+    if (waitpid(a, &st, 0) < 0) { perror("waitpid a"); return 1; } report("child A", st);
+    if (waitpid(b, &st, 0) < 0) { perror("waitpid b"); return 1; } report("child B", st);
+    return 0;
+}
+
+Analysis
+Syscalls: two fork(), two waitpid().
+Flow: Two children return different codes; parent reports normal exit vs signal via macros.
+Observation: waitpid gives precise control over which child is reaped and when.
+
+
+Assignment 5 — Handling Zombie Processes
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+int main(int argc, char **argv) {
+    setbuf(stdout, NULL);
+    int do_wait = (argc > 1 && argv[1][0] == 'w'); // pass "wait" to reap
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+
+    if (pid == 0) {
+        printf("[child] PID=%d exiting now\n", getpid());
+        _exit(0);
+    }
+
+    if (!do_wait) {
+        printf("[parent] PID=%d not waiting; sleep 10s (inspect zombie with ps/top/htop)\n", getpid());
+        sleep(10);
+        return 0;
+    } else {
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0) { perror("waitpid"); return 1; }
+        printf("[parent] reaped child PID=%d, WIFEXITED=%d, code=%d\n",
+               pid, WIFEXITED(status) ? 1 : 0, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return 0;
+    }
+}
+
+Analysis
+Zombie demo: Without `wait`, a finished child remains `Z` (zombie) until reaped or until parent exits.
+Prevention: wait()/waitpid() reaps the child and frees the kernel table entry.
+Observe: Run ./a5_zombie_demo (no args) and inspect with ps -o pid,ppid,state,comm | grep zombie_demo or htop. Then run ./a5_zombie_demo wait to see proper reaping.
+
+Repo link:https://github.com/edmondavetisyan/processes-assignments
